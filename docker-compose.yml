@@ -1,0 +1,43 @@
+services:
+  slice-web:
+    build: .
+    image: return-slice-service:latest
+    ports:
+      - "8000:8000"
+    environment:
+      SLICE_DATA_DIR: /data
+      SLICE_SOURCE_DB: /data/source.db
+      SLICE_BATCH_SIZE: "500"
+      SLICE_MAX_WORKERS: "2"
+      GUNICORN_WORKERS: "1"
+      GUNICORN_THREADS: "4"
+    volumes:
+      - slice-data:/data
+    restart: unless-stopped
+
+  # 可选：持续修改源库的压测/演示容器（默认不启动，
+  # 用 `docker compose --profile writer up` 一并启动）
+  demo-writer:
+    profiles: ["writer"]
+    image: return-slice-service:latest
+    depends_on:
+      - slice-web
+    environment:
+      SLICE_SOURCE_DB: /data/source.db
+    volumes:
+      - slice-data:/data
+    entrypoint: ["python", "-I", "-c"]
+    command:
+      - |
+        import sys, time
+        sys.path.insert(0, "/app")
+        from app.demo import DemoWriter
+        w = DemoWriter("/data/source.db", interval=2.0)
+        w.start()
+        print("demo writer started")
+        while True:
+            time.sleep(3600)
+    restart: unless-stopped
+
+volumes:
+  slice-data:

@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>退货单 SQLite 切片服务</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header>
+  <h1>售后退货单 · SQLite 切片服务</h1>
+  <p class="sub">输入退货单 ID，后台在同一快照上递归抽取外键闭包，生成通过外键检查的 SQLite 切片</p>
+</header>
+
+<main>
+  <section class="card">
+    <h2>1 · 提交切片任务</h2>
+    <form id="job-form">
+      <input type="number" id="return-order-id" min="1" placeholder="退货单 ID，例如 1" required>
+      <button type="submit">开始抽取</button>
+    </form>
+    <p id="form-msg" class="msg"></p>
+    <details>
+      <summary>示例库数据说明（循环引用 / 不反向带入）</summary>
+      <ul class="hint">
+        <li>客户推荐环：客户 1 ↔ 2 互相推荐，客户 3 自推荐。</li>
+        <li>退货单 1 与 2 同属订单 1：抽取退货单 1 时，退货单 2 不会被反向带入。</li>
+        <li>订单 1 的订单行 3 从未退货，不应出现在切片中。</li>
+        <li>可在抽取进行中开启下方“持续写入”，验证整份切片仍来自同一快照。</li>
+      </ul>
+    </details>
+  </section>
+
+  <section class="card">
+    <h2>2 · 示例源库持续修改</h2>
+    <div class="row">
+      <button id="writer-start" class="secondary">开始持续写入（增/改/删）</button>
+      <button id="writer-stop" class="secondary">停止写入</button>
+      <button id="writer-tick" class="secondary">手动写入一次</button>
+      <span id="writer-state" class="badge">写入器：停止</span>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>3 · 源库当前行数</h2>
+    <table id="source-table" class="data">
+      <thead><tr><th>表</th><th>中文名</th><th>行数</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section class="card">
+    <h2>4 · 切片任务与进度</h2>
+    <table id="jobs-table" class="data">
+      <thead>
+      <tr>
+        <th>任务 ID</th><th>退货单</th><th>状态</th><th>进度</th>
+        <th>各表行数</th><th>操作</th>
+      </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </section>
+</main>
+
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
