@@ -11,17 +11,24 @@
    （``PRAGMA temp_store=FILE``）。Python 每次只取出 ``batch_size`` 行处理，
    从不把全部选中 ID 或全部记录读进内存；数据拷贝同样按键集分页流式进行。
 
-3. 精确闭包，不反向带入
-   种子集合 = 指定退货单本身 + 该退货单的全部退货明细。
-   之后仅沿外键*正向*递归（如 退货单 -> 订单 -> 客户），绝不做反向 JOIN，
-   因此同一订单的其它退货单、未被退货的订单行都不会进入切片。
+3. 外键声明驱动的精确闭包，不反向带入
+   种子集合 = 指定退货单本身 + 该退货单的全部退货明细。明细的归属、以及
+   之后每一层扩展，都严格按 ``PRAGMA foreign_key_list`` 读到的*单列外键
+   声明*行进：外键可以引用父表 id，也可以引用父表的其它单列唯一键
+   （退货业务号、客户业务码等）。匹配用 SQL 连接完成，父列固定写在等号
+   左侧，因此比较遵循 SQLite 语义——按父列的类型亲和性与排序规则
+   （如 NOCASE）判定，数字文本与大小写差异都能正确命中，且绝不修改
+   原值、不引入无关行。只沿外键*正向*递归（退货单 -> 订单 -> 客户），
+   不做反向 JOIN，因此同一订单的其它退货单、未被退货的订单行都不会
+   进入切片。
 
 4. 缺失引用即整体失败
-   种子不存在、或任一非空外键在快照中找不到目标行，立即抛出
+   种子不存在、或任一非空外键按声明在快照中找不到目标行，立即抛出
    MissingReferenceError，删除临时残件，不产出切片文件。
 
 5. 成环支持
-   seen 临时表对 (表, id) 去重，客户推荐关系成环时自然收敛。
+   候选目标一律解析为父表整数 id 后入 seen 临时表去重，客户推荐关系
+   成环（含 NOCASE 业务码互引）时自然收敛。
 """
 from __future__ import annotations
 
@@ -34,7 +41,6 @@ from typing import Any
 
 from .schema import (
     DatabaseSchema,
-    ForeignKey,
     RETURN_LINE_TABLE,
     RETURN_ORDER_TABLE,
     TABLES,
@@ -184,7 +190,9 @@ def _open_snapshot(source_db: str) -> sqlite3.Connection:
 
 
 def _create_temp_tables(conn: sqlite3.Connection) -> None:
-    # WITHOUT ROWID 的复合主键表，去重与查找都走主键索引（落盘）
+    # WITHOUT ROWID 的复合主键表，去重与查找都走主键索引（落盘）。
+    # 候选目标在 SQL 连接阶段就解析成父表整数 id，因此临时表始终
+    # 只存 (表名, 整数 id)，与父列是 id 还是业务键无关。
     conn.executescript(
         """
         CREATE TEMP TABLE seen (
@@ -216,7 +224,12 @@ def _seed(
     schema: DatabaseSchema,
     return_order_id: int,
 ) -> None:
-    """写入种子：指定退货单 + 它的全部退货明细。"""
+    """写入种子：指定退货单 + 它的全部退货明细。
+
+    明细归属严格按“退货明细 -> 退货单”的外键声明判定：子列值与
+    父列（id 或退货业务号等唯一键）匹配即属于该退货单。比较由
+    SQL 连接完成，父列写在等号左侧，沿用父列的亲和性与排序规则。
+    """
     ro = quote_ident(RETURN_ORDER_TABLE)
     rl = quote_ident(RETURN_LINE_TABLE)
 
@@ -228,6 +241,11 @@ def _seed(
             f"种子退货单不存在: {RETURN_ORDER_TABLE}.id = {return_order_id}"
         )
 
+    # 内省已校验：退货明细 -> 退货单 恰好一条单列外键
+    fk = schema.return_lines_fk()
+    child = quote_ident(fk.column)
+    parent = quote_ident(fk.ref_column)
+
     conn.execute(
         "INSERT INTO seen(table_name, id) VALUES (?, ?)",
         (RETURN_ORDER_TABLE, return_order_id),
@@ -237,22 +255,18 @@ def _seed(
         (RETURN_ORDER_TABLE, return_order_id),
     )
     # 该退货单的*全部*明细作为种子；只按外键正向取，不碰其它退货单的明细
+    line_rows = f"""
+        SELECT {_lit(RETURN_LINE_TABLE)}, rl.id
+        FROM {rl} AS rl
+        JOIN {ro} AS ro ON ro.{parent} = rl.{child}
+        WHERE ro.id = ?
+    """
     conn.execute(
-        f"""
-        INSERT INTO seen(table_name, id)
-        SELECT {_lit(RETURN_LINE_TABLE)}, id
-        FROM {rl}
-        WHERE return_order_id = ?
-        """,
+        f"INSERT INTO seen(table_name, id) {line_rows}",
         (return_order_id,),
     )
     conn.execute(
-        f"""
-        INSERT INTO frontier(table_name, id)
-        SELECT {_lit(RETURN_LINE_TABLE)}, id
-        FROM {rl}
-        WHERE return_order_id = ?
-        """,
+        f"INSERT INTO frontier(table_name, id) {line_rows}",
         (return_order_id,),
     )
 
@@ -292,12 +306,44 @@ def _traverse(
             t = quote_ident(table_name)
             for fk in schema.fks_from(table_name):
                 col = quote_ident(fk.column)
-                # 只沿外键正向收集非空目标 ID；DISTINCT 由 cand 主键去重
+                ref_t = quote_ident(fk.ref_table)
+                ref_col = quote_ident(fk.ref_column)
+                # 父列固定写在等号左侧：比较采用父列的排序规则（如
+                # NOCASE）；类型亲和性按 SQLite 规则对两侧对称生效，
+                # 数字文本（'700' 与 700）也能正确匹配。
+                #
+                # 1) 缺失检查（反连接）：任一非空外键在父表快照中
+                #    找不到目标 -> 整次失败，不留残件
+                missing = conn.execute(
+                    f"""
+                    SELECT src.{col}
+                    FROM {t} AS src
+                    WHERE src.{col} IS NOT NULL
+                      AND src.id IN (
+                          SELECT id FROM batch
+                          WHERE table_name = {_lit(table_name)}
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM {ref_t} AS p
+                          WHERE p.{ref_col} = src.{col}
+                      )
+                    LIMIT 1
+                    """
+                ).fetchone()
+                if missing is not None:
+                    raise MissingReferenceError(
+                        f"缺失外键目标: {fk.ref_table}.{fk.ref_column} = "
+                        f"{missing[0]}（{table_name}.{fk.column} 的引用"
+                        f"在源库快照中不存在）"
+                    )
+                # 2) 正向收集：按外键声明连接父表，把目标解析为父表
+                #    整数 id；DISTINCT 之外的重叠由 cand 主键去重
                 conn.execute(
                     f"""
                     INSERT OR IGNORE INTO cand(table_name, id)
-                    SELECT DISTINCT {_lit(fk.ref_table)}, src.{col}
+                    SELECT DISTINCT {_lit(fk.ref_table)}, p.id
                     FROM {t} AS src
+                    JOIN {ref_t} AS p ON p.{ref_col} = src.{col}
                     WHERE src.{col} IS NOT NULL
                       AND src.id IN (
                           SELECT id FROM batch
@@ -305,8 +351,6 @@ def _traverse(
                       )
                     """
                 )
-
-        _assert_references_exist(conn)
 
         # 先入队（排除已在 seen/frontier 的），再登记 seen
         conn.execute(
@@ -350,38 +394,10 @@ def _traverse(
         )
 
 
-def _assert_references_exist(conn: sqlite3.Connection) -> None:
-    """对 cand 中每个目标表做反连接，缺任一引用即整体失败。"""
-    ref_tables = [
-        r[0]
-        for r in conn.execute(
-            "SELECT DISTINCT table_name FROM cand"
-        ).fetchall()
-    ]
-    for ref_table in ref_tables:
-        t = quote_ident(ref_table)
-        missing = conn.execute(
-            f"""
-            SELECT c.id
-            FROM cand c
-            WHERE c.table_name = {_lit(ref_table)}
-              AND NOT EXISTS (
-                  SELECT 1 FROM {t} WHERE {t}.id = c.id
-              )
-            LIMIT 1
-            """
-        ).fetchone()
-        if missing is not None:
-            raise MissingReferenceError(
-                f"缺失外键目标: {ref_table}.id = {missing[0]} "
-                f"在源库快照中不存在"
-            )
-
-
 def _build_destination_ddl(
     dest: sqlite3.Connection, schema: DatabaseSchema
 ) -> None:
-    """原样保留六表的 CREATE 语句（字段、主键、外键定义）与索引。"""
+    """原样保留六表的 CREATE 语句（字段、主键、唯一键、外键）与索引。"""
     script_lines: list[str] = ["PRAGMA journal_mode = DELETE;"]
     for name in schema.table_order:
         ts = schema.tables[name]
@@ -400,7 +416,11 @@ def _stream_copy(
     batch_size: int,
     report: ProgressFn,
 ) -> dict[str, int]:
-    """按键集分页把 seen 集合中的行流式拷入切片，进程内存有界。"""
+    """按键集分页把 seen 集合中的行流式拷入切片，进程内存有界。
+
+    按原列顺序、原值 INSERT：业务号、业务码等字段的存储类型与
+    大小写都与源库一致，不做任何归一化。
+    """
     copied_counts: dict[str, int] = {}
     for table in schema.table_order:
         ts = schema.tables[table]

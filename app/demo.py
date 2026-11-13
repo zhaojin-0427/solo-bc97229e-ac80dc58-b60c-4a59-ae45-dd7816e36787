@@ -1,7 +1,11 @@
 """本地示例源库与持续修改模拟器。
 
-示例库（WAL 模式，结构与生产源库一致）：
-- 客户表含循环推荐关系：c1 -> c2 -> c1（两环）、c3 -> c3（自环）
+示例库（WAL 模式，结构与生产源库一致）专门覆盖单列外键的两类目标：
+- 退货明细通过*业务号*关联退货单：return_orders.id=1 的退货业务号
+  return_no='700'（TEXT 唯一键），return_lines.return_order_id 存整数
+  700 并声明 REFERENCES return_orders(return_no) —— 匹配靠父列亲和性
+- 客户业务码 NOCASE 环：c1('Alpha') <-> c2('BETA') 以不同大小写互引，
+  c3('Gamma') 自引 —— 匹配靠父列排序规则
 - 同一订单挂两张退货单，用于证明不会反向带入兄弟退货单
 - 订单含未退货的订单行，用于证明不反向带入其它明细
 
@@ -10,7 +14,6 @@
 """
 from __future__ import annotations
 
-import os
 import sqlite3
 import threading
 import time
@@ -21,8 +24,9 @@ PRAGMA journal_mode = WAL;
 
 CREATE TABLE customers (
     id INTEGER PRIMARY KEY,
+    code TEXT NOT NULL COLLATE NOCASE UNIQUE,
     name TEXT NOT NULL,
-    referred_by INTEGER REFERENCES customers(id)
+    referred_by_code TEXT REFERENCES customers(code)
 );
 CREATE TABLE products (
     id INTEGER PRIMARY KEY,
@@ -44,6 +48,7 @@ CREATE TABLE order_lines (
 );
 CREATE TABLE return_orders (
     id INTEGER PRIMARY KEY,
+    return_no TEXT NOT NULL UNIQUE,
     order_id INTEGER NOT NULL REFERENCES orders(id),
     customer_id INTEGER NOT NULL REFERENCES customers(id),
     reason TEXT NOT NULL,
@@ -51,7 +56,7 @@ CREATE TABLE return_orders (
 );
 CREATE TABLE return_lines (
     id INTEGER PRIMARY KEY,
-    return_order_id INTEGER NOT NULL REFERENCES return_orders(id),
+    return_order_id INTEGER NOT NULL REFERENCES return_orders(return_no),
     order_line_id INTEGER NOT NULL REFERENCES order_lines(id),
     product_id INTEGER NOT NULL REFERENCES products(id),
     quantity INTEGER NOT NULL
@@ -77,13 +82,16 @@ def build_demo_db(path: str | Path, *, with_orphan: bool = False) -> Path:
         # 建表阶段先关外键：客户推荐关系含前向引用与环，无法按插入顺序满足
         conn.execute("PRAGMA foreign_keys = OFF")
         conn.executescript(SCHEMA_SQL)
+        # 客户业务码 NOCASE 环：1('Alpha') <-> 2('BETA') 大小写互引，
+        # 3('Gamma') 大小写自引，4 普通引用 1
         conn.executemany(
-            "INSERT INTO customers(id, name, referred_by) VALUES (?, ?, ?)",
+            "INSERT INTO customers(id, code, name, referred_by_code) "
+            "VALUES (?, ?, ?, ?)",
             [
-                (1, "张三", 2),
-                (2, "李四", 1),   # 1 <-> 2 两环
-                (3, "王五", 3),   # 自环
-                (4, "赵六", 1),
+                (1, "Alpha", "张三", "beta"),
+                (2, "BETA", "李四", "ALPHA"),
+                (3, "Gamma", "王五", "gamma"),
+                (4, "Delta", "赵六", "Alpha"),
             ],
         )
         conn.executemany(
@@ -114,34 +122,38 @@ def build_demo_db(path: str | Path, *, with_orphan: bool = False) -> Path:
                 (4, 2, 3, 1),
             ],
         )
+        # 退货单：id 为整数主键，return_no 为业务号（TEXT 唯一键）。
         # 同订单两张退货单：抽取退货单 1 时不得带入退货单 2
         conn.executemany(
-            "INSERT INTO return_orders(id, order_id, customer_id, reason, "
-            "status) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO return_orders(id, return_no, order_id, "
+            "customer_id, reason, status) VALUES (?, ?, ?, ?, ?, ?)",
             [
-                (1, 1, 1, "耳机质量问题", "approved"),
-                (2, 1, 1, "键盘误购", "received"),
-                (3, 2, 2, "显示器坏点", "approved"),
+                (1, "700", 1, 1, "耳机质量问题", "approved"),
+                (2, "701", 1, 1, "键盘误购", "received"),
+                (3, "702", 2, 2, "显示器坏点", "approved"),
             ],
         )
+        # 明细引用退货*业务号*（return_no='700'），列类型为 INTEGER：
+        # 数字文本 '700' 与整数 700 靠父列亲和性匹配
         conn.executemany(
             "INSERT INTO return_lines(id, return_order_id, order_line_id, "
             "product_id, quantity) VALUES (?, ?, ?, ?, ?)",
             [
-                (1, 1, 1, 1, 1),
-                (2, 2, 2, 2, 1),
-                (3, 3, 4, 3, 1),
+                (1, 700, 1, 1, 1),
+                (2, 701, 2, 2, 1),
+                (3, 702, 4, 3, 1),
             ],
         )
         if with_orphan:
-            # 断引用：指向不存在的退货单 -> 触发整次失败、无残件
+            # 断引用：属于退货单 1（业务号 700）但订单行不存在
+            # -> 抽取退货单 1 时整次失败、无残件
             conn.execute(
                 "INSERT INTO return_lines(id, return_order_id, "
                 "order_line_id, product_id, quantity) "
-                "VALUES (99, 9999, 1, 1, 1)"
+                "VALUES (99, 700, 9999, 1, 1)"
             )
         else:
-            # 正常示例库必须自身满足全部外键（含环）
+            # 正常示例库必须自身满足全部外键（含 NOCASE 环与数字文本）
             violations = conn.execute("PRAGMA foreign_key_check").fetchall()
             if violations:
                 raise RuntimeError(f"示例库外键违例: {violations}")
@@ -192,9 +204,10 @@ class DemoWriter:
                 n = self.ticks
                 rid = 9000 + n
                 conn.execute(
-                    "INSERT INTO return_orders(id, order_id, customer_id, "
-                    "reason, status) VALUES (?, 1, 1, ?, 'draft')",
-                    (rid, f"演示写入 tick {n}"),
+                    "INSERT INTO return_orders(id, return_no, order_id, "
+                    "customer_id, reason, status) "
+                    "VALUES (?, ?, 1, 1, ?, 'draft')",
+                    (rid, str(900000 + n), f"演示写入 tick {n}"),
                 )
                 conn.execute(
                     "UPDATE return_orders SET status = ? WHERE id = ?",

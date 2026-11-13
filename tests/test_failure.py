@@ -15,11 +15,13 @@ def test_seed_return_order_missing(source_db, schema, out_path):
 
 
 def test_missing_fk_reference_fails_atomically(orphan_db, out_path):
-    """断引用源库：抽取退货单 1 的过程中遇到缺失目标，整体失败、无残件。"""
+    """断引用源库：退货单 1 的明细 99 指向不存在的订单行 9999。
+
+    断引用在闭包遍历阶段才暴露，必须整次失败、无残件。
+    """
     schema = introspect(str(orphan_db))
-    # 退货单 99 自身断引用；另构造一个让闭包遍历阶段才发现断引用的场景
-    with pytest.raises(MissingReferenceError):
-        run_extraction(str(orphan_db), schema, 99, out_path)
+    with pytest.raises(MissingReferenceError, match="order_lines.id = 9999"):
+        run_extraction(str(orphan_db), schema, 1, out_path)
     assert not out_path.exists()
     assert not out_path.with_name(out_path.name + ".partial").exists()
 

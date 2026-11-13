@@ -48,20 +48,21 @@ def test_exact_closure_for_return_order_1(source_db, schema, out_path):
 
 
 def test_cyclic_self_reference_included(source_db, schema, out_path):
-    """退货单 3 -> 客户 2 -> 客户 1，两环全部保留且外键检查通过。"""
+    """退货单 3 -> 客户 2 -> 客户 1，NOCASE 业务码两环全部保留且外键检查通过。"""
     run_extraction(str(source_db), schema, 3, out_path)
     with _open(out_path) as conn:
         assert _ids(conn, "customers") == {1, 2}
         rows = {
-            r["id"]: r["referred_by"]
-            for r in conn.execute("SELECT id, referred_by FROM customers")
+            r["id"]: r["referred_by_code"]
+            for r in conn.execute("SELECT id, referred_by_code FROM customers")
         }
-        assert rows == {1: 2, 2: 1}  # 环结构原值保留
+        # 环结构原值保留：大小写差异不改写（'beta' / 'ALPHA'）
+        assert rows == {1: "beta", 2: "ALPHA"}
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
 def test_self_loop_customer_3(source_db, schema, tmp_path):
-    """构造客户自环场景：c3.referred_by = c3 已在示例库中。"""
+    """构造客户自环场景：c3.referred_by_code = 'gamma'（NOCASE 匹配 'Gamma'）。"""
     # 让一张退货单走到客户 3：临时挂一条订单/退货单
     conn = sqlite3.connect(str(source_db))
     conn.execute("PRAGMA foreign_keys = ON")
@@ -71,12 +72,13 @@ def test_self_loop_customer_3(source_db, schema, tmp_path):
             "VALUES (10, 3, 'SO-X', 'paid')"
         )
         conn.execute(
-            "INSERT INTO return_orders(id, order_id, customer_id, reason, "
-            "status) VALUES (10, 10, 3, 'x', 'approved')"
+            "INSERT INTO return_orders(id, return_no, order_id, "
+            "customer_id, reason, status) "
+            "VALUES (10, '710', 10, 3, 'x', 'approved')"
         )
         conn.execute(
             "INSERT INTO return_lines(id, return_order_id, order_line_id, "
-            "product_id, quantity) VALUES (10, 10, 1, 1, 1)"
+            "product_id, quantity) VALUES (10, 710, 1, 1, 1)"
         )
     conn.close()
 
@@ -87,8 +89,8 @@ def test_self_loop_customer_3(source_db, schema, tmp_path):
         # 正向带入客户 1、2（两环），这是外键闭包的正确结果
         assert {3, 1, 2} <= _ids(c, "customers")
         assert c.execute(
-            "SELECT referred_by FROM customers WHERE id = 3"
-        ).fetchone()[0] == 3
+            "SELECT referred_by_code FROM customers WHERE id = 3"
+        ).fetchone()[0] == "gamma"
         assert c.execute("PRAGMA foreign_key_check").fetchall() == []
 
 

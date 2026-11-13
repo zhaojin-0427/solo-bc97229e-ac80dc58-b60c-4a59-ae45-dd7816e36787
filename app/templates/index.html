@@ -21,9 +21,13 @@
     </form>
     <p id="form-msg" class="msg"></p>
     <details>
-      <summary>示例库数据说明（循环引用 / 不反向带入）</summary>
+      <summary>示例库数据说明（业务号外键 / 循环引用 / 不反向带入）</summary>
       <ul class="hint">
-        <li>客户推荐环：客户 1 ↔ 2 互相推荐，客户 3 自推荐。</li>
+        <li>退货单 id=1 的退货业务号 return_no='700'，退货明细经
+            <code>return_order_id=700 REFERENCES return_orders(return_no)</code>
+            关联——外键可引用 id 以外的单列唯一键。</li>
+        <li>客户业务码 NOCASE 环：客户 1（Alpha）↔ 客户 2（BETA）以不同大小写互引，
+            客户 3（Gamma）自引——按父列排序规则匹配。</li>
         <li>退货单 1 与 2 同属订单 1：抽取退货单 1 时，退货单 2 不会被反向带入。</li>
         <li>订单 1 的订单行 3 从未退货，不应出现在切片中。</li>
         <li>可在抽取进行中开启下方“持续写入”，验证整份切片仍来自同一快照。</li>
